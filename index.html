@@ -39,9 +39,234 @@ template: title_layout
 
 # Recap Session Documents
 
-- Slides: http://akrog.github.io/austin_recap_conditional_updates
-- Etherpad: https://etherpad.openstack.org/p/
-- DevRef: Pending
+- Slides: .medium[http://akrog.github.io/austin_recap_conditional_updates]
+- Etherpad: .medium[https://etherpad.openstack.org/p/cinder-newton-mitakarecap]
+- DevRef: In my TODO list
+- Some functionality not available yet
+    * One patch pending to merge
+    * Needed changes on SQLAlchemy &#10142; Merged
+    * [Add ordering possibilities to conditional update](https://review.openstack.org/231936)
+
+---
+
+# DB Conditional Updates
+
+- Mechanism implemented to remove API races
+- Compare-and-swap
+- SQL equivalent of:
+
+```SQL
+    UPDATE ... FROM ... WHERE ...;
+```
+
+- Better performance than:
+
+    * Locks
+    * DB Alternative to
+    ```SQL
+    SELECT ... FOR UPDATE;
+    ```
+
+---
+
+# Implementation
+
+- Abstraction layers:
+    - OVO layer
+    - DB layer
+    - SQLAlchemy layer
+    - SQL Engine
+
+---
+
+# OVO layer method
+
+```python
+    def conditional_update(self, values, expected_values=None, filters=(),
+                           save_all=False, session=None, reflect_changes=True):
+```
+
+- *values* &#10142; Dict with changes we want to make
+- *expected_values* &#10142; Dict with required conditions (`id == resource.id`)
+- *filters* &#10142; Iterable with SQLAlchemy filters
+- *save_all* &#10142; Save OVO's dirty fields?
+- *session* &#10142; SQLAlchemy session (unlikely to be used)
+- *reflect_changes* &#10142; Update OVO with changes (default *True*)
+- Returns number of changed rows
+
+---
+
+# Basic usage
+
+- Simple match
+
+    ```python
+        values={'status': 'deleting',
+                'terminated_at': timeutils.utcnow()}
+
+        expected_values = {'status': 'available',
+                           'consistencygroup_id': None}
+
+        filters = []  # Must be an iterable, never None
+
+        volume.conditional_update(values, expected_values, filters)
+    ```
+
+- Iterable match: .medium[Correct handle of *None* value in range &#10142; unlike SQL IN]
+
+    ```python
+        expected_values={
+            'status': ('available', 'error', 'error_restoring' 'error_extending'),
+            'migration_status': (None, 'deleting', 'error', 'success'),
+            'consistencygroup_id': None
+        }
+    ```
+
+---
+
+# Basic usage (II)
+
+- Exclusion .medium[(Also accepts iterables)]
+
+    ```python
+        expected_values={
+            'attach_status': volume.Not('attached'),  # OVO objects have Not class
+            'status': ('available', 'error', 'error_restoring' 'error_extending'),
+            'migration_status': (None, 'deleting', 'error', 'success'),
+            'consistencygroup_id': None
+        }
+    ```
+
+- Filters
+
+    ```python
+        # Define filter in cinder/db/apipy and cinder/db/sqlalchemy/api.py:
+        def volume_has_snapshots_filter():
+            return sql.exists().where(
+                and_(models.Volume.id == models.Snapshot.volume_id,
+                     ~models.Snapshot.deleted))
+
+        filters = [~db.volume_has_snapshots_filter()]  # Negate filters on the API
+    ```
+
+---
+
+# Building filters on the API
+
+- `model` field in OVO:
+    * Reference to ORM model
+    * Access to ORM fields
+    * Can be used to join tables
+
+- As *expected_values*
+    ``` python
+        values = {'status': 'restoring'}
+        expected_values={'status': 'available',
+                         objects.Volume.model.id: backup.volume_id,
+                         objects.Volume.model.status: 'available'}
+    ```
+
+- As *filters*
+    ```python
+        filters = [objects.Volume.model.id == backup.volume_id,
+                   objects.Volume.model.status == 'available']
+    ```
+
+---
+
+# Using other fields for assignment
+
+- Using non modified fields
+    ```python
+        values = {'disabled': True,
+                  'updated_at': service.model.updated_at}
+    ```
+
+- Using modified field
+    ```python
+        values = {'status': 'retyping',
+                  'previous_status': volume.model.status}
+    ```
+
+- Together with filters
+    ```python
+        values = {'in_use': quota.in_use + volume.size}
+        filters = [quota.model.in_use <= max_usage - volume.size]
+    ```
+
+---
+
+# Conditional value setting
+
+- `Case` class in OVO
+- Equivalent to SQL `CASE`
+- Must use SQLAlchemy filters
+- Can be constructed using `model` field
+- May have a default value &#10142; Use field to leave as it is
+    ```python
+        values = {
+            'status': volume.Case(
+                [
+                    (volume.model.status == 'available', 'maintenance')
+                ],
+                else_=volume.model.status)
+        }
+    ```
+
+---
+
+
+# *reflect_changes*
+
+- May have performance implications
+- Default value is *True* &#10142; Will try to update OVO
+- With *field assignment* and *Case* &#10142; Unknown actual DB value
+- `conditional_update` OVO method reloads object from DB
+- Reload uses *get_by_id* generic method
+- Set `reflect_changes` to *False* if we don't care about stored value
+
+---
+
+# Auto ordering considerations
+
+- MariaDB issue &#10142; .medium[SQLAlchemy decides order of generated SQL]
+    ```SQL
+		UPDATE volumes SET previous_status=status, status='retyping'
+        WHERE id='44f284f9-877d-4fce-9eb4-67a052410054';
+    ```
+    * *status* and *previous_status* set to the same value
+- New SQLAlchemy code allows setting order for UPDATE
+- Conditional update has automatic order
+    1. Manually specified order
+    2. Values that refer to other ORM field (simple and using operations)
+    3. Values that use Case clause (since they may be using fields as well)
+    4. All other values
+
+---
+
+# Limitations:
+
+- We can only use functionality that works on **all** supported DBs
+- Don't update using modified fields
+    * No `status=X, previous_status=volume.model.status`
+	* Until this patch merges: https://review.openstack.org/231936
+- PostgreSQL doesn't support multi table update
+    * But we can use multiple tables in *expected_values*
+
+---
+
+# Considerations for new ORM & OVOs
+
+- Naming restrictions of OVO class, ORM class, and get methods.
+- Exceptions are supported &#10142; Avoid them if possible
+- OVO class and ORM class must have the same name
+    * Exception example: BackupImport OVO class maps to Backup ORM class
+	* Add exceptions to `VO_TO_MODEL_EXCEPTIONS` mapping
+        + In `cinder.db.sqlalchemy.api.get_model_for_versioned_object`
+- Get method &#10142; ORM class name to snake format + "_get"
+    * First argument is `context` and second is `id` (may have more)
+	* Add exceptions to `GET_EXCEPTIONS` mapping
+        + In `cinder.db.sqlalchemy.api._get_get_method`
 
 ---
 
