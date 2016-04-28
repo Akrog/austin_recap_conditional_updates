@@ -190,7 +190,7 @@ template: title_layout
 
 - Together with filters
     ```python
-        values = {'in_use': quota.in_use + volume.size}
+        values = {'in_use': quota.model.in_use + volume.size}
         filters = [quota.model.in_use <= max_usage - volume.size]
     ```
 
@@ -231,10 +231,10 @@ template: title_layout
 
 - MariaDB issue &#10142; .medium[SQLAlchemy decides order of generated SQL]
     ```SQL
-		UPDATE volumes SET previous_status=status, status='retyping'
+		UPDATE volumes SET status='retyping', previous_status=status
         WHERE id='44f284f9-877d-4fce-9eb4-67a052410054';
     ```
-    * *status* and *previous_status* set to the same value
+    * *status* and *previous_status* are set to the same value
 - New SQLAlchemy code allows setting order for UPDATE
 - Conditional update has automatic order
     1. Manually specified order
