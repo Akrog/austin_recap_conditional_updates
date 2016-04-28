@@ -229,12 +229,13 @@ template: title_layout
 
 # Auto ordering considerations
 
-- MariaDB issue &#10142; .medium[SQLAlchemy decides order of generated SQL]
+- MariaDB issue &#10142; Requires specific order of assignments
     ```SQL
 		UPDATE volumes SET status='retyping', previous_status=status
         WHERE id='44f284f9-877d-4fce-9eb4-67a052410054';
     ```
     * *status* and *previous_status* are set to the same value
+    * Known and documented deviation from the standard &#10142; Will not change
 - New SQLAlchemy code allows setting order for UPDATE
 - Conditional update has automatic order
     1. Manually specified order
